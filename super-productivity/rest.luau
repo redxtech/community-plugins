@@ -137,20 +137,23 @@ function M.reschedule_body(json, mode, now_ms)
   -- TODO: revisit reminder clearing after this PR is merged and released:
   -- https://github.com/super-productivity/super-productivity/pull/9716
   if mode == "hour" then
-    return '{"dueWithTime":' .. tostring(math.floor(now_ms + 60 * 60 * 1000)) .. ',"dueDay":null}'
+    local due_time = math.floor(now_ms + 60 * 60 * 1000)
+    return '{"dueWithTime":' .. tostring(due_time) .. ',"dueDay":null}', "dueWithTime", due_time
   end
   if mode ~= "tomorrow" and mode ~= "week" then return nil end
   local due_day = rest_state.date_after_days(now_ms, mode == "tomorrow" and 1 or 7)
   if due_day == nil then return nil end
   local encoded_ok, encoded = pcall(json.encode, due_day)
   if not encoded_ok or type(encoded) ~= "string" then return nil end
-  return '{"dueDay":' .. encoded .. ',"dueWithTime":null}'
+  return '{"dueDay":' .. encoded .. ',"dueWithTime":null}', "dueDay", due_day
 end
 
 function M.new(runtime)
   local client = {
     runtime = runtime,
     token = nil,
+    token_source = nil,
+    token_sources = {},
     discovery_signature = "",
     sequence = 0,
     pending = {},
@@ -179,6 +182,8 @@ function M.new(runtime)
     if signature ~= self.discovery_signature then
       self.discovery_signature = signature
       self.token = nil
+      self.token_source = nil
+      self.token_sources = {}
     end
   end
 
@@ -189,8 +194,14 @@ function M.new(runtime)
     local override = trim(options.rest_token_file) ~= ""
     for _, path in ipairs(M.token_candidates(options)) do
       local raw = self.runtime.readFile(path)
-      if type(raw) == "string" and M.valid_token(raw) then
+      local source = self.token_sources[path]
+      if source == nil or source.raw ~= raw then
+        source = { raw = raw, rejected = false }
+        self.token_sources[path] = source
+      end
+      if not source.rejected and type(raw) == "string" and M.valid_token(raw) then
         self.token = trim(raw)
+        self.token_source = source
         return self.token
       end
       if override then break end
@@ -198,9 +209,12 @@ function M.new(runtime)
     return nil
   end
 
-  function client:invalidate_token(token)
-    if token == self.token then
+  function client:invalidate_token(source)
+    -- each request retains its file version so late 401 responses cannot reject a newer version.
+    source.rejected = true
+    if source == self.token_source then
       self.token = nil
+      self.token_source = nil
     end
   end
 
@@ -223,7 +237,7 @@ function M.new(runtime)
 
     local status = tonumber(response.status)
     if status == 401 then
-      client:invalidate_token(request.token)
+      client:invalidate_token(request.token_source)
       finish(id, { ok = false, kind = "auth_required", status = status })
       return
     end
@@ -287,7 +301,7 @@ function M.new(runtime)
       callback = callback,
       deadline = now_ms + REQUEST_TIMEOUT_MS,
       dispatched = false,
-      token = token,
+      token_source = client.token_source,
       expected_status = contract.status,
       validate = contract.validate,
     }
@@ -381,7 +395,12 @@ function M.new(runtime)
       callback({ ok = false, kind = "request_error", dispatched = false })
       return false
     end
-    return request("PATCH", path, { isDone = is_done }, callback, { status = 200, validate = valid_task })
+    return request("PATCH", path, { isDone = is_done }, callback, {
+      status = 200,
+      validate = function(value)
+        return valid_task(value) and value.id == task_id and value.isDone == is_done
+      end,
+    })
   end
 
   function client:start_task(task_id, callback)
@@ -402,12 +421,20 @@ function M.new(runtime)
 
   function client:reschedule_task(task_id, mode, now_ms, callback)
     local path = task_path(task_id)
-    local body = M.reschedule_body(self.runtime.json, mode, now_ms)
+    local body, due_field, due_value = M.reschedule_body(self.runtime.json, mode, now_ms)
     if path == nil or body == nil then
       callback({ ok = false, kind = "request_error", dispatched = false })
       return false
     end
-    return request("PATCH", path, nil, callback, { raw_body = body, status = 200, validate = valid_task })
+    return request("PATCH", path, nil, callback, {
+      raw_body = body,
+      status = 200,
+      validate = function(value)
+        local cleared_field = due_field == "dueDay" and "dueWithTime" or "dueDay"
+        return valid_task(value) and value.id == task_id and value[due_field] == due_value
+          and value[cleared_field] == nil
+      end,
+    })
   end
 
   return client

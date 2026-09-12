@@ -357,7 +357,8 @@ local function task_card(task)
 end
 
 local function capture_card()
-  local busy = action.status == "working" and action.type == "add"
+  local busy = action.status == "working"
+  local adding = busy and action.type == "add"
   return ui.column({ gap = 7, padding = 11, radius = 9, fill = "surface_variant/0.25" }, {
     ui.label({ text = tr("capture.title"), fontWeight = "bold" }),
     ui.label({ text = tr("capture.hint"), color = "on_surface_variant", fontSize = 10, maxLines = 3 }),
@@ -371,7 +372,7 @@ local function capture_card()
         onChange = "onCaptureChanged",
         onSubmit = "onCaptureSubmit",
       }),
-      ui.button({ text = busy and tr("actions.adding") or tr("actions.add"), glyph = "plus", enabled = not busy and common.trim(draft) ~= "", onClick = "onCaptureAdd" }),
+      ui.button({ text = adding and tr("actions.adding") or tr("actions.add"), glyph = "plus", enabled = not busy and common.trim(draft) ~= "", onClick = "onCaptureAdd" }),
     }),
   })
 end
@@ -498,6 +499,8 @@ noctalia.state.watch(common.ACTION_KEY, function(value)
     draft = ""
     submitted_request_id = nil
     input_revision += 1
+  elseif submitted_request_id ~= nil and action.rejectedRequestId == submitted_request_id then
+    submitted_request_id = nil
   elseif is_submitted_capture and common.terminal_action(action) then
     submitted_request_id = nil
   end
@@ -571,7 +574,9 @@ local function submit_capture(value)
   local text = common.trim(value ~= nil and value or draft)
   if text == "" or action.status == "working" then return end
   draft = text
-  submitted_request_id = common.send_intent("add", { input = text, source = "panel" })
+  common.send_intent("add", { input = text, source = "panel" }, function(request_id)
+    submitted_request_id = request_id
+  end)
   render_panel()
 end
 

@@ -4,6 +4,7 @@
 local common = require("./common.luau")
 local rest = require("./rest.luau")
 local rest_state = require("./rest_state.luau")
+local operation = require("./operation.luau")
 
 local FLATPAK_ID = rest.FLATPAK_ID
 local BRIDGE_NAME = "noctalia-super-productivity"
@@ -12,9 +13,6 @@ local PACKAGE_METADATA_NAME = "companion-package.json"
 local PLUGIN_DIR = tostring(noctalia.pluginDir() or "")
 local SCHEMA_VERSION = 1
 local BRIDGE_PROTOCOL_VERSION = common.PROTOCOL_VERSION
-local COMMAND_TIMEOUT_MS = 12000
-local OPEN_TIMEOUT_MS = 30000
-local UNDO_WINDOW_MS = 30000
 local MAX_FUTURE_SKEW_MS = 5000
 local MAX_CHANGE_REASON = 120
 local SOUND_NAME = "task-complete"
@@ -57,7 +55,6 @@ local state = {
   undo = nil,
 }
 
-local action = { status = "idle" }
 local bridge_dir = ""
 local selected_bridge_method = ""
 local connection_path = ""
@@ -66,9 +63,9 @@ local bridge_error_path = ""
 local command_dir = ""
 local response_dir = ""
 local connection_signature = nil
+local change_signature = nil
 local bridge_error_signature = nil
 local last_change_sequence = nil
-local command_sequence = 0
 local browse_index = 1
 local last_file_poll_ms = 0
 local last_bridge_search_ms = 0
@@ -76,18 +73,17 @@ local last_process_check_ms = 0
 local last_due_check_ms = noctalia.nowMs()
 local service_started_at = last_due_check_ms
 local auto_start_attempted = false
-local pending_open_request = nil
-local pending_select = nil
 local reset_view_on_refresh = false
 local sound_ready = false
-local active_rest_action = nil
-local refreshed_current_task_id = nil
 local refresh_running = false
 local refresh_again = false
 local refresh_waiters = {}
 local queued_refresh_waiters = {}
 local rest_client = rest.new(noctalia)
 local request_rest_state
+local operations
+local published_state = nil
+local published_minute = nil
 
 local function trim(value)
   return common.trim(value)
@@ -222,21 +218,37 @@ local function update_overall_status()
 end
 
 local function publish()
-  if state.bridgeStatus ~= "ready" then
-    state.hookStatus = state.bridgeStatus
-    state.hookError = state.bridgeError
-  end
   local installed_version = trim(state.companionVersion)
   local required_version = trim(state.requiredCompanionVersion)
   state.companionUpdateRequired = installed_version ~= "" and required_version ~= ""
     and installed_version ~= required_version
   update_overall_status()
-  noctalia.state.set(common.SNAPSHOT_KEY, state)
-end
-
-local function publish_action(next_action)
-  action = next_action or { status = "idle" }
-  noctalia.state.set(common.ACTION_KEY, action)
+  local minute = math.floor(noctalia.nowMs() / 60000)
+  local changed = published_state == nil
+    or (state.view ~= nil and minute ~= published_minute)
+  -- nested state records are replaced, so identity detects their changes without
+  -- traversing task data on idle ticks. nil fields need the reverse comparison.
+  if not changed then
+    for key, value in pairs(state) do
+      if published_state[key] ~= value then changed = true; break end
+    end
+    if not changed then
+      for key, value in pairs(published_state) do
+        if state[key] ~= value then changed = true; break end
+      end
+    end
+  end
+  if not changed then return end
+  published_state = table.clone(state)
+  published_minute = minute
+  -- bridge availability masks hook diagnostics only in the published snapshot,
+  -- so a fresh heartbeat can restore cached change metadata without rereading it.
+  local snapshot = table.clone(state)
+  if state.bridgeStatus ~= "ready" then
+    snapshot.hookStatus = state.bridgeStatus
+    snapshot.hookError = state.bridgeError
+  end
+  noctalia.state.set(common.SNAPSHOT_KEY, snapshot)
 end
 
 local function set_bridge_dir(path)
@@ -259,12 +271,13 @@ local function set_bridge_dir(path)
   state.changedAt = 0
   state.changeReason = ""
   connection_signature = nil
+  change_signature = nil
   bridge_error_signature = nil
   last_change_sequence = nil
 end
 
 local function discover_bridge_dir()
-  if pending_select ~= nil and bridge_dir ~= "" then return end
+  if operations ~= nil and operations:bridge_pinned() and bridge_dir ~= "" then return end
   local override = trim(noctalia.getConfig("bridge_dir"))
   if override ~= "" then
     set_bridge_dir(without_trailing_slash(noctalia.expandPath(override)))
@@ -373,6 +386,7 @@ local function complete_refresh(results)
     failure = { kind = "invalid_response" }
   end
 
+  local confirmation
   if failure == nil then
     local now_ms = noctalia.nowMs()
     local previous_id = if reset_view_on_refresh then nil else state.view and state.view.task.id or nil
@@ -383,7 +397,10 @@ local function complete_refresh(results)
       results.status.data,
       now_ms
     )
-    refreshed_current_task_id = results.status.data.currentTaskId
+    confirmation = table.freeze({
+      currentTask = normalized.currentTask and table.freeze({ id = normalized.currentTask.id }) or nil,
+      currentTaskId = results.status.data.currentTaskId,
+    })
     state.currentTask = normalized.currentTask
     state.upcoming = normalized.upcoming
     state.counts = normalized.counts
@@ -403,7 +420,7 @@ local function complete_refresh(results)
 
   local waiters = refresh_waiters
   refresh_waiters = {}
-  for _, callback in ipairs(waiters) do callback(failure == nil, failure) end
+  for _, callback in ipairs(waiters) do callback(failure == nil, failure, confirmation) end
   publish()
 
   if refresh_again then
@@ -506,9 +523,11 @@ local function refresh_change_file()
   if change_path == "" then return end
   local signature = file_signature(change_path)
   if signature == nil then
+    change_signature = nil
     if state.bridgeStatus == "ready" then state.hookStatus = "waiting" end
     return
   end
+  if signature == change_signature then return end
   local change = decode_file(change_path)
   if not valid_change(change) then
     state.hookStatus = type(change) == "table"
@@ -528,6 +547,7 @@ local function refresh_change_file()
     return
   end
 
+  change_signature = signature
   state.companionVersion = tostring(change.companionVersion)
   state.protocolVersion = BRIDGE_PROTOCOL_VERSION
   state.hookStatus = "ready"
@@ -575,6 +595,7 @@ local function resolve_launch()
     local available = noctalia.flatpakAppInstalled(FLATPAK_ID)
     return {
       spec = { "flatpak", "run", FLATPAK_ID },
+      processCommand = "superproductivity",
       method = "flatpak",
       available = available,
       error = if available then nil else noctalia.tr("error.app_unavailable"),
@@ -583,7 +604,7 @@ local function resolve_launch()
 
   local command = trim(noctalia.getConfig("native_command"))
   if command == "" then command = "superproductivity" end
-  if command:find("%s") then
+  if command:sub(1, 1) ~= "/" and command:find("%s") then
     return { method = "native", available = false, error = noctalia.tr("error.native_command_single") }
   end
   local available
@@ -595,6 +616,7 @@ local function resolve_launch()
   end
   return {
     spec = { command },
+    processCommand = command,
     method = "native",
     available = available,
     error = if available then nil else noctalia.tr("error.app_unavailable"),
@@ -625,229 +647,22 @@ local function launch_app()
 end
 
 local function probe_process()
-  noctalia.processMatches(function(matched)
+  local resolved = resolve_launch()
+  local command = resolved.processCommand or "superproductivity"
+  local function complete(matched)
     state.appRunning = matched == true
-    apply_launch_diagnostics(resolve_launch())
+    apply_launch_diagnostics(resolved)
     if not state.appRunning and state.bridgeStatus == "ready" then state.bridgeStatus = "offline" end
     publish()
-  end, "superproductivity")
-end
-
-local function command_id()
-  command_sequence += 1
-  return "noctalia-" .. tostring(math.floor(noctalia.nowMs())) .. "-" .. tostring(command_sequence)
-end
-
-local function write_select_command(task_id, request_id)
-  if pending_select ~= nil then return false, "Another companion request is already active." end
-  if bridge_dir == "" then discover_bridge_dir() end
-  if bridge_dir == "" then return false, noctalia.tr("error.bridge_unavailable") end
-  local ok, mkdir_error = noctalia.mkdirAll(command_dir)
-  if not ok then return false, tostring(mkdir_error or noctalia.tr("error.bridge_unavailable")) end
-
-  local id = command_id()
-  local issued_at = noctalia.nowMs()
-  local command = {
-    schemaVersion = SCHEMA_VERSION,
-    protocolVersion = BRIDGE_PROTOCOL_VERSION,
-    id = id,
-    action = "select",
-    issuedAt = issued_at,
-    expiresAt = issued_at + COMMAND_TIMEOUT_MS,
-    payload = { taskId = task_id },
-  }
-  local encoded, encode_error = noctalia.json.encode(command, true)
-  if type(encoded) ~= "string" then return false, tostring(encode_error or "JSON encode failed") end
-  local final_path = command_dir .. "/" .. id .. ".json"
-  local temp_path = final_path .. ".tmp"
-  local wrote, write_error = noctalia.writeFile(temp_path, encoded)
-  if not wrote then return false, tostring(write_error or "Command write failed") end
-  local renamed, rename_error = noctalia.renameFile(temp_path, final_path)
-  if not renamed then
-    noctalia.removeFile(temp_path)
-    return false, tostring(rename_error or "Command publish failed")
   end
-
-  pending_select = {
-    id = id,
-    requestId = request_id,
-    taskId = task_id,
-    startedAt = issued_at,
-    commandPath = final_path,
-  }
-  state.lastCommandAt = issued_at
-  publish_action({
-    status = "working",
-    commandId = id,
-    requestId = request_id,
-    type = "select",
-    taskId = task_id,
-  })
-  publish()
-  return true
-end
-
-local function finish_select(response)
-  local request = pending_select
-  if request == nil then return end
-  pending_select = nil
-  local now_ms = noctalia.nowMs()
-  state.lastResponseAt = now_ms
-  if response.ok == true then
-    publish_action({
-      status = "success",
-      commandId = request.id,
-      requestId = request.requestId,
-      type = "select",
-      taskId = request.taskId,
-      data = response.data,
-      completedAt = now_ms,
-    })
-  else
-    local message = trim(response.error)
-    if message == "" then message = noctalia.tr("error.command_failed") end
-    state.bridgeError = message
-    state.lastError = message
-    publish_action({
-      status = "error",
-      commandId = request.id,
-      requestId = request.requestId,
-      type = "select",
-      taskId = request.taskId,
-      error = message,
-      completedAt = now_ms,
-    })
-    noctalia.notifyError(noctalia.tr("notify.command_failed_title"), message)
-  end
-end
-
-local function valid_select_response(response, request)
-  return type(response) == "table"
-    and tonumber(response.schemaVersion) == SCHEMA_VERSION
-    and tonumber(response.protocolVersion) == BRIDGE_PROTOCOL_VERSION
-    and response.id == request.id
-    and response.action == "select"
-    and type(response.ok) == "boolean"
-end
-
-local function process_responses()
-  if response_dir == "" then return end
-  local entries = noctalia.listDir(response_dir)
-  if type(entries) ~= "table" then return end
-  for _, name in ipairs(entries) do
-    local id = tostring(name):match("^(.-)%.json$")
-    if id ~= nil then
-      local path = response_dir .. "/" .. tostring(name)
-      local response = decode_file(path)
-      if pending_select ~= nil and pending_select.id == id then
-        if valid_select_response(response, pending_select) then
-          finish_select(response)
-        else
-          finish_select({ ok = false, error = noctalia.tr("error.protocol_mismatch") })
-        end
-      end
-      noctalia.removeFile(path)
+  noctalia.processMatches(function(matched)
+    if matched ~= true and command ~= "superproductivity" then
+      -- wrappers can exec the standard process after launch.
+      noctalia.processMatches(complete, "superproductivity")
+    else
+      complete(matched)
     end
-  end
-end
-
-local function expire_select(now_ms)
-  if pending_select == nil or now_ms - pending_select.startedAt <= COMMAND_TIMEOUT_MS then return end
-  local request = pending_select
-  pending_select = nil
-  if request.commandPath ~= nil and noctalia.fileExists(request.commandPath) then
-    noctalia.removeFile(request.commandPath)
-  end
-  local message = noctalia.tr("error.command_timeout")
-  state.bridgeError = message
-  state.lastError = message
-  publish_action({
-    status = "error",
-    commandId = request.id,
-    requestId = request.requestId,
-    type = "select",
-    taskId = request.taskId,
-    error = message,
-    completedAt = now_ms,
-  })
-end
-
-local function try_pending_open(now_ms)
-  local pending_open = pending_open_request
-  if type(pending_open) ~= "table" then return end
-  if now_ms >= pending_open.expiresAt then
-    pending_open_request = nil
-    local message = noctalia.tr("error.launch_failed")
-    state.bridgeError = message
-    state.lastError = message
-    publish_action({
-      status = "error",
-      requestId = pending_open.requestId,
-      type = "select",
-      taskId = pending_open.taskId,
-      error = message,
-      completedAt = now_ms,
-    })
-    return
-  end
-  refresh_connection_file()
-  local companion_ready = state.bridgeStatus == "ready"
-    and (pending_open.readyAfter == 0 or state.connectionUpdatedAt >= pending_open.readyAfter)
-  if companion_ready then
-    local started, message = write_select_command(pending_open.taskId, pending_open.requestId)
-    if started then
-      pending_open_request = nil
-    elseif message ~= nil then
-      state.bridgeError = message
-      state.lastError = message
-    end
-  end
-end
-
-local function operation_busy()
-  return active_rest_action ~= nil or pending_open_request ~= nil or pending_select ~= nil
-end
-
-local function reject_overlapping_action(request_id)
-  local message = "Another Super Productivity action is already active."
-  state.lastError = message
-  -- report the rejection without replacing the active operation's working state.
-  local next_action = table.clone(action)
-  next_action.rejectedRequestId = request_id
-  publish_action(next_action)
-  noctalia.notifyError(noctalia.tr("notify.command_failed_title"), message)
-  publish()
-end
-
-local function open_task(task_id, request_id)
-  if trim(task_id) == "" then return end
-  if operation_busy() then
-    reject_overlapping_action(request_id)
-    return
-  end
-  local now_ms = noctalia.nowMs()
-  refresh_connection_file()
-  local bridge_ready = state.bridgeStatus == "ready"
-  pending_open_request = {
-    taskId = task_id,
-    requestId = request_id,
-    readyAfter = bridge_ready and 0 or now_ms,
-    expiresAt = now_ms + OPEN_TIMEOUT_MS,
-  }
-  publish_action({ status = "working", requestId = request_id, type = "select", taskId = task_id })
-  if not launch_app() then
-    pending_open_request = nil
-    publish_action({
-      status = "error",
-      requestId = request_id,
-      type = "select",
-      taskId = task_id,
-      error = state.bridgeError,
-      completedAt = now_ms,
-    })
-    return
-  end
-  try_pending_open(now_ms)
+  end, command)
 end
 
 local function play_completion_sound()
@@ -863,108 +678,57 @@ local function clear_rest_task_state()
   browse_index = 1
 end
 
-local function begin_rest_action(kind, task_id, request_id, metadata, dispatch)
-  if operation_busy() then
-    reject_overlapping_action(request_id)
-    return false
-  end
-  active_rest_action = {
-    type = kind,
-    taskId = task_id,
-    requestId = request_id,
-    metadata = metadata or {},
-    startedAt = noctalia.nowMs(),
-  }
-  publish_action({
-    status = "working",
-    requestId = request_id,
-    type = kind,
-    taskId = task_id,
-  })
-
-  dispatch(function(result)
-    local current = active_rest_action
-    if current == nil or current.requestId ~= request_id then return end
-    local now_ms = noctalia.nowMs()
-    if result.ok == true then
-      local next_action = {
-        status = "success",
-        requestId = request_id,
-        type = kind,
-        taskId = task_id,
-        data = result.data,
-      }
-      if kind == "complete" then
-        local task = current.metadata.task
-        if type(task) == "table" then
-          state.undo = { task = task, expiresAt = now_ms + UNDO_WINDOW_MS }
-          next_action.canUndo = true
-        end
-        browse_index = 1
-        reset_view_on_refresh = true
-        play_completion_sound()
-      elseif kind == "restore" then
-        state.undo = nil
-      elseif kind == "add" and current.metadata.source == "launcher" then
-        noctalia.notify(noctalia.tr("notify.added_title"), current.metadata.input or "")
-      end
-      request_rest_state(function(refreshed)
-        local pending = active_rest_action
-        if pending == nil or pending.requestId ~= request_id then return end
-        active_rest_action = nil
-        if not refreshed then clear_rest_task_state() end
-        -- A timer acknowledgement is not proof that tracking changed. Confirm it
-        -- from the post-action refresh (queued behind any refresh already running).
-        -- The authoritative ID can exist even when the task details are absent.
-        if kind == "timer_start" or kind == "timer_stop" then
-          local confirmed = if kind == "timer_start"
-            then state.currentTask ~= nil and state.currentTask.id == task_id
-            else state.currentTask == nil and refreshed_current_task_id == nil
-          if not refreshed then
-            next_action.status = "unknown"
-            next_action.error = noctalia.tr("error.timer_confirmation_unknown")
-          elseif not confirmed then
-            next_action.status = "error"
-            next_action.error = noctalia.tr("error.timer_confirmation_mismatch")
-          end
-          if next_action.error ~= nil then
-            state.lastError = next_action.error
-            noctalia.notifyError(noctalia.tr("notify.command_failed_title"), next_action.error)
-          end
-        end
-        next_action.completedAt = noctalia.nowMs()
-        publish_action(next_action)
-        publish()
-      end)
-      return
-    end
-
-    active_rest_action = nil
-    local message = rest_failure_message(result)
-    local uncertain = (result.kind == "timeout" or result.kind == "transport_error")
-      and result.dispatched == true
-    local status = uncertain and "unknown" or "error"
+operations = operation.new({
+  schema = SCHEMA_VERSION,
+  protocol = common.PROTOCOL_VERSION,
+  now = noctalia.nowMs,
+  tr = noctalia.tr,
+  rest = rest_client,
+  refresh = request_rest_state,
+  publish_action = function(value) noctalia.state.set(common.ACTION_KEY, value) end,
+  publish = publish,
+  failure_message = rest_failure_message,
+  rest_failure = function(result, message)
     state.lastError = message
     if result.kind == "auth_required" or result.kind == "timeout"
       or result.kind == "transport_error" or result.kind == "invalid_response" then
       state.restStatus = rest_status_for_failure(result)
       state.restError = message
     end
-    publish_action({
-      status = status,
-      requestId = request_id,
-      type = kind,
-      taskId = task_id,
-      error = message,
-      completedAt = now_ms,
-    })
-    if status == "error" then
-      noctalia.notifyError(noctalia.tr("notify.command_failed_title"), message)
-    end
-    publish()
-  end)
-  return true
-end
+  end,
+  set_error = function(message, bridge)
+    state.lastError = message
+    if bridge then state.bridgeError = message end
+  end,
+  notify_error = function(message) noctalia.notifyError(noctalia.tr("notify.command_failed_title"), message) end,
+  notify_added = function(input) noctalia.notify(noctalia.tr("notify.added_title"), input) end,
+  complete = function(task, now_ms)
+    if type(task) == "table" then state.undo = { task = task, expiresAt = now_ms + 30000 } end
+    browse_index = 1
+    reset_view_on_refresh = true
+    play_completion_sound()
+  end,
+  restore = function() state.undo = nil end,
+  clear_tasks = clear_rest_task_state,
+  connection = function()
+    refresh_connection_file()
+    return state.bridgeStatus == "ready", state.connectionUpdatedAt
+  end,
+  launch = function() return launch_app(), state.bridgeError end,
+  bridge_paths = function()
+    if bridge_dir == "" then discover_bridge_dir() end
+    return command_dir, response_dir
+  end,
+  command_sent = function(now_ms) state.lastCommandAt = now_ms end,
+  response_received = function(now_ms) state.lastResponseAt = now_ms end,
+  mkdir = noctalia.mkdirAll,
+  encode = noctalia.json.encode,
+  write = noctalia.writeFile,
+  rename = noctalia.renameFile,
+  remove = noctalia.removeFile,
+  list = noctalia.listDir,
+  decode_file = decode_file,
+})
 
 local function verify_companion_package()
   refresh_package_state(true)
@@ -1088,33 +852,12 @@ local function handle_intent(intent)
     browse_index = ((browse_index - 1 + delta) % #list) + 1
     rebuild_view()
     publish()
-  elseif kind == "refresh" then
-    if operation_busy() then
-      reject_overlapping_action(request_id)
-      return
-    end
-    active_rest_action = { type = "refresh", requestId = request_id, startedAt = noctalia.nowMs() }
-    publish_action({ status = "working", requestId = request_id, type = "refresh" })
-    request_rest_state(function(ok, failure)
-      if active_rest_action == nil or active_rest_action.requestId ~= request_id then return end
-      active_rest_action = nil
-      local now_ms = noctalia.nowMs()
-      if ok then
-        publish_action({ status = "success", requestId = request_id, type = "refresh", completedAt = now_ms })
-      else
-        publish_action({
-          status = "error",
-          requestId = request_id,
-          type = "refresh",
-          error = rest_failure_message(failure),
-          completedAt = now_ms,
-        })
-      end
-    end)
   elseif kind == "launch" then
     launch_app()
-  elseif kind == "open" then
-    open_task(task_id, request_id)
+  elseif kind == "refresh" then
+    operations:submit({ type = "refresh", requestId = request_id })
+  elseif kind == "open" and task_id ~= "" then
+    operations:submit({ type = "open", taskId = task_id, requestId = request_id })
   elseif kind == "complete" and task_id ~= "" then
     local task = state.view and state.view.task or nil
     if type(task) ~= "table" or task.id ~= task_id then
@@ -1122,36 +865,21 @@ local function handle_intent(intent)
       publish()
       return
     end
-    begin_rest_action("complete", task_id, request_id, { task = task }, function(callback)
-      rest_client:set_done(task_id, true, callback)
-    end)
+    operations:submit({ type = "complete", taskId = task_id, requestId = request_id, task = task })
   elseif kind == "add" then
     local input = type(intent.input) == "string" and intent.input or ""
     if trim(input) ~= "" then
-      begin_rest_action("add", nil, request_id, {
-        input = input,
-        source = intent.source,
-      }, function(callback)
-        rest_client:add_task(input, callback)
-      end)
+      operations:submit({ type = "add", requestId = request_id, input = input, source = intent.source })
     end
   elseif kind == "timer_toggle" and task_id ~= "" then
     local is_current = type(state.currentTask) == "table" and state.currentTask.id == task_id
-    local operation = is_current and "timer_stop" or "timer_start"
-    begin_rest_action(operation, task_id, request_id, nil, function(callback)
-      if is_current then rest_client:stop_task(callback) else rest_client:start_task(task_id, callback) end
-    end)
+    operations:submit({ type = is_current and "timer_stop" or "timer_start", taskId = task_id, requestId = request_id })
   elseif kind == "snooze" and task_id ~= "" then
-    local mode = tostring(intent.mode or "")
-    begin_rest_action("snooze", task_id, request_id, nil, function(callback)
-      rest_client:reschedule_task(task_id, mode, noctalia.nowMs(), callback)
-    end)
+    operations:submit({ type = "snooze", taskId = task_id, requestId = request_id, mode = tostring(intent.mode or "") })
   elseif kind == "undo" then
     local undo = state.undo
     if type(undo) == "table" and undo.expiresAt > noctalia.nowMs() then
-      begin_rest_action("restore", undo.task.id, request_id, nil, function(callback)
-        rest_client:set_done(undo.task.id, false, callback)
-      end)
+      operations:submit({ type = "restore", taskId = undo.task.id, requestId = request_id })
     end
   end
 end
@@ -1176,12 +904,10 @@ function update()
     refresh_change_file()
     refresh_bridge_error()
   end
-  process_responses()
-  expire_select(now_ms)
+  operations:update(now_ms)
   due_notifications(now_ms)
 
   if type(state.undo) == "table" and state.undo.expiresAt <= now_ms then state.undo = nil end
-  try_pending_open(now_ms)
 
   if noctalia.getConfig("auto_start") == true and not auto_start_attempted
     and not state.appRunning and now_ms - service_started_at > 1500 and state.restStatus ~= "ready" then
@@ -1208,6 +934,5 @@ local accepted = noctalia.sound.load(SOUND_NAME, "sounds/ding-small-bell.mp3", f
   if not sound_ready and load_error ~= nil then noctalia.log("super-productivity: " .. tostring(load_error)) end
 end)
 if not accepted then noctalia.log("super-productivity: completion sound load was not accepted") end
-publish_action(action)
 publish()
 request_rest_state()

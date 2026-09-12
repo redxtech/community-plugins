@@ -139,6 +139,8 @@ The completion sound is Super Productivity's default `ding-small-bell.mp3`, sour
 - The widget shows active, incomplete tasks with a scheduled date or time. Timed tasks use their exact timestamp. Date-only tasks are due at the end of their local calendar day. Earlier tasks appear first. Parent tasks and subtasks can appear.
 - When `prefer_tracked_task` is enabled, the currently tracked task appears before scheduled tasks.
 - Noctalia refreshes REST data at startup, after successful task actions, after manual refreshes, and after companion notifications. It does not poll task data at short intervals.
+- Noctalia processes one foreground task action at a time. If another action arrives, it rejects the new request and keeps the current action active.
+- A timer start or stop remains in progress until refreshed REST state confirms the result. A failed confirmation refresh reports an unknown outcome. Contradictory timer state reports an error.
 - Without the companion, REST task loading and actions still work. Automatic refreshes and exact-task opening do not. Use **Refresh** after changes made directly in Super Productivity.
 - REST rescheduling does not clear an existing reminder. The old reminder can still fire after `+1 hour`, `Tomorrow`, or `Next week` changes the task date.
 - Noctalia does not replay timed-out changes. A timed-out action might still succeed, so check Super Productivity before trying again.

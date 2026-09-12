@@ -29,7 +29,7 @@ class ServiceLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="sp-service-launcher-") as directory:
             root = Path(directory)
             sources = []
-            for name in ("common", "rest", "rest_state", "service", "launcher"):
+            for name in ("common", "rest", "rest_state", "operation", "service", "launcher", "panel"):
                 source = (PLUGIN / f"{name}.luau").read_text()
                 sources.append(f'["{name}"] = [====[{source}]====],')
             (root / "service-launcher-sources.luau").write_text(
@@ -46,6 +46,15 @@ class ServiceLauncherTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(f"{scenario} passed", result.stdout)
 
+    def test_launch_resolution_and_process_probes(self):
+        for scenario in (
+            "launch-default", "launch-custom", "launch-path", "launch-wrapper",
+            "launch-stopped", "launch-missing-path", "launch-invalid",
+            "launch-flatpak", "launch-auto-flatpak",
+        ):
+            with self.subTest(scenario=scenario):
+                self.run_scenario(scenario)
+
     def test_timer_confirmation(self):
         for scenario in (
             "timer-start-success", "timer-stop-success",
@@ -55,6 +64,11 @@ class ServiceLauncherTests(unittest.TestCase):
             "timer-stop-unresolved",
             "timer-start-queued-failed", "timer-stop-queued-contradictory",
         ):
+            with self.subTest(scenario=scenario):
+                self.run_scenario(scenario)
+
+    def test_operation_integration(self):
+        for scenario in ("selection-pinning", "confirmation-timeout", "terminal-refresh-reentrancy", "selection-synchronous"):
             with self.subTest(scenario=scenario):
                 self.run_scenario(scenario)
 
@@ -75,6 +89,16 @@ class ServiceLauncherTests(unittest.TestCase):
 
     def test_connection_expiry(self):
         self.run_scenario("expiry")
+
+    def test_quiet_service_loop(self):
+        for scenario in (
+            "idle-ticks", "response-scanning", "time-publication", "rest-timeout-ticks",
+        ):
+            with self.subTest(scenario=scenario):
+                self.run_scenario(scenario)
+
+    def test_change_metadata_recovers_after_clock_skew(self):
+        self.run_scenario("change-clock-skew")
 
 
 if __name__ == "__main__":
